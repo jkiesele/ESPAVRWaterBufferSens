@@ -170,6 +170,14 @@ public:
 
     void loop();
 
+    bool consumeConfigChangedFlag(){
+        if (newConfig_) {
+            newConfig_ = false;
+            return true;
+        }
+        return false;
+    }
+
     Blob currentBlob() const { return blob_; }//copies not atomic, but good enough for this use case since no ISRs
 
     //always false since the Serial buffer is used under the hood.
@@ -178,6 +186,7 @@ public:
 private:
     Transport transport_;
     Blob& blob_;
+    bool newConfig_ = false;
 };
 
 

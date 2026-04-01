@@ -75,6 +75,7 @@ void Slave::loop() {
     if (!transport_.readFrame(frame)) return;
     if (frame.flags & kFlagWrite) {
         blob_.config = frame.blob.config;
+        newConfig_ = true;
     }
     
     // On both READ and WRITE: respond with current blob.

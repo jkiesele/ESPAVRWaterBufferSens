@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include "WaterBufferSens.h"
+#include "EEPROM.h"
 
 using namespace AvrSensorLink;
 
@@ -262,6 +263,16 @@ static void updateStateFromMeasurement() {
     setPermitOutput(gPermit);
 }
 
+// --- read load from eeprom
+
+static void loadConfig(Config& cfg) {
+    EEPROM.get(0, cfg);
+}
+
+static void saveConfig(const Config& cfg) {
+    EEPROM.put(0, cfg);
+}
+
 // ============================================================
 // Arduino setup / loop
 // ============================================================
@@ -282,9 +293,15 @@ void setup() {
 
     gBlob.runtime.inhibit = 1;
     gBlob.runtime.warn    = 0;
+
+    //read from eeprom
+    loadConfig(gBlob.config);
 }
 
 void loop() {
     updateStateFromMeasurement();
     gSlave.loop();
+    if(gSlave.consumeConfigChangedFlag()){
+        saveConfig(gBlob.config);
+    }
 }
