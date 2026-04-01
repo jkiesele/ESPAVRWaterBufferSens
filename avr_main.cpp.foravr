@@ -1,0 +1,290 @@
+#pragma once
+#include <Arduino.h>
+#include "WaterBufferSens.h"
+
+using namespace AvrSensorLink;
+
+// ============================================================
+// Pin config
+// Topology per channel:
+//   DRIVE_PIN -- 1M -- SENSE_PIN
+//   SENSE_PIN -> touch pad
+//
+// Open-collector style interlock output:
+//   permit  => pin drives LOW
+//   inhibit => pin is INPUT (released), external pullup makes line HIGH
+// ============================================================
+
+static constexpr uint8_t PIN_REF_DRIVE = 2;
+static constexpr uint8_t PIN_REF_SENSE = 3;
+
+static constexpr uint8_t PIN_A_DRIVE   = 4;
+static constexpr uint8_t PIN_A_SENSE   = 5;
+
+static constexpr uint8_t PIN_B_DRIVE   = 6;
+static constexpr uint8_t PIN_B_SENSE   = 7;
+
+static constexpr uint8_t PIN_PERMIT_OC = 8;
+
+// ============================================================
+// Timing / logic config
+// ============================================================
+
+static constexpr uint16_t kMeasureTimeoutTicks = 4000;   // Timer1 ticks, prescaler 8 -> 0.5 us/tick @16 MHz
+static constexpr uint8_t  kTripConfirmCount    = 2;      // fast trip
+static constexpr uint8_t  kRearmConfirmCount   = 6;      // slower rearm
+static constexpr uint8_t  kSamplesPerCycle     = 3;      // small median filter
+
+// ============================================================
+// Global protocol state
+// ============================================================
+
+Blob gBlob;
+Slave gSlave(Serial, gBlob);
+
+// ============================================================
+// Small helpers
+// ============================================================
+
+struct SensePin {
+    uint8_t drivePin;
+    uint8_t sensePin;
+    volatile uint8_t* inReg;
+    uint8_t mask;
+};
+
+SensePin gRef{PIN_REF_DRIVE, PIN_REF_SENSE, nullptr, 0};
+SensePin gA  {PIN_A_DRIVE,   PIN_A_SENSE,   nullptr, 0};
+SensePin gB  {PIN_B_DRIVE,   PIN_B_SENSE,   nullptr, 0};
+
+static inline void initSensePin(SensePin& p) {
+    pinMode(p.drivePin, OUTPUT);
+    digitalWrite(p.drivePin, LOW);
+
+    pinMode(p.sensePin, INPUT);
+    p.inReg = portInputRegister(digitalPinToPort(p.sensePin));
+    p.mask  = digitalPinToBitMask(p.sensePin);
+}
+
+static inline bool senseHigh(const SensePin& p) {
+    return (*p.inReg & p.mask) != 0;
+}
+
+static inline void setPermitOutput(bool permit) {
+    if (permit) {
+        pinMode(PIN_PERMIT_OC, OUTPUT);
+        digitalWrite(PIN_PERMIT_OC, LOW);
+    } else {
+        pinMode(PIN_PERMIT_OC, INPUT);
+    }
+}
+
+static inline void timer1Init() {
+    TCCR1A = 0;
+    TCCR1B = 0;
+    // prescaler 8 -> 0.5 us per tick at 16 MHz
+    TCCR1B = _BV(CS11);
+    TCNT1 = 0;
+}
+
+static inline void timer1Reset() {
+    TCNT1 = 0;
+}
+
+static inline uint16_t timer1Now() {
+    return TCNT1;
+}
+
+static inline uint16_t median3(uint16_t a, uint16_t b, uint16_t c) {
+    if (a > b) { uint16_t t = a; a = b; b = t; }
+    if (b > c) { uint16_t t = b; b = c; c = t; }
+    if (a > b) { uint16_t t = a; a = b; b = t; }
+    return b;
+}
+
+// ============================================================
+// Simultaneous measurement of Ref / A / B
+// ============================================================
+
+struct RawTimes {
+    uint16_t ref;
+    uint16_t a;
+    uint16_t b;
+    bool okRef;
+    bool okA;
+    bool okB;
+};
+
+static RawTimes measureOnce() {
+    RawTimes r{};
+    r.ref = kMeasureTimeoutTicks;
+    r.a   = kMeasureTimeoutTicks;
+    r.b   = kMeasureTimeoutTicks;
+
+    // 1) hard discharge
+    digitalWrite(gRef.drivePin, LOW);
+    digitalWrite(gA.drivePin,   LOW);
+    digitalWrite(gB.drivePin,   LOW);
+
+    pinMode(gRef.drivePin, OUTPUT);
+    pinMode(gA.drivePin,   OUTPUT);
+    pinMode(gB.drivePin,   OUTPUT);
+
+    pinMode(gRef.sensePin, INPUT);
+    pinMode(gA.sensePin,   INPUT);
+    pinMode(gB.sensePin,   INPUT);
+
+    delayMicroseconds(50);
+
+    // 2) start all together
+    timer1Reset();
+    digitalWrite(gRef.drivePin, HIGH);
+    digitalWrite(gA.drivePin,   HIGH);
+    digitalWrite(gB.drivePin,   HIGH);
+
+    bool gotRef = false;
+    bool gotA   = false;
+    bool gotB   = false;
+
+    while (true) {
+        const uint16_t t = timer1Now();
+
+        if (!gotRef && senseHigh(gRef)) {
+            r.ref = t;
+            gotRef = true;
+            r.okRef = true;
+        }
+        if (!gotA && senseHigh(gA)) {
+            r.a = t;
+            gotA = true;
+            r.okA = true;
+        }
+        if (!gotB && senseHigh(gB)) {
+            r.b = t;
+            gotB = true;
+            r.okB = true;
+        }
+
+        if (gotRef && gotA && gotB) break;
+        if (t >= kMeasureTimeoutTicks) break;
+    }
+
+    // Return lines low again so the pads sit discharged between measurements.
+    digitalWrite(gRef.drivePin, LOW);
+    digitalWrite(gA.drivePin,   LOW);
+    digitalWrite(gB.drivePin,   LOW);
+
+    return r;
+}
+
+static RawTimes measureFiltered() {
+    RawTimes m0 = measureOnce();
+    RawTimes m1 = measureOnce();
+    RawTimes m2 = measureOnce();
+
+    RawTimes out{};
+    out.ref = median3(m0.ref, m1.ref, m2.ref);
+    out.a   = median3(m0.a,   m1.a,   m2.a);
+    out.b   = median3(m0.b,   m1.b,   m2.b);
+
+    out.okRef = m0.okRef && m1.okRef && m2.okRef;
+    out.okA   = m0.okA   && m1.okA   && m2.okA;
+    out.okB   = m0.okB   && m1.okB   && m2.okB;
+    return out;
+}
+
+// ============================================================
+// Dry-run logic
+// Assumption:
+// - larger charge time = wetter / more capacitance
+// - therefore dA = A - Ref and dB = B - Ref are larger when wet
+// - trip if dB < tripB
+// - rearm if dA > rearmA
+// ============================================================
+
+static bool gPermit = false;
+static uint8_t gTripCounter = 0;
+static uint8_t gRearmCounter = 0;
+
+static void updateStateFromMeasurement() {
+    const RawTimes raw = measureFiltered();
+
+    gBlob.runtime.ref = raw.ref;
+    gBlob.runtime.a   = raw.a;
+    gBlob.runtime.b   = raw.b;
+
+    const int16_t dA = int16_t(raw.a) - int16_t(raw.ref);
+    const int16_t dB = int16_t(raw.b) - int16_t(raw.ref);
+
+    gBlob.runtime.dA = dA;
+    gBlob.runtime.dB = dB;
+
+    const bool allValid = raw.okRef && raw.okA && raw.okB;
+
+    if (!allValid) {
+        gPermit = false;
+        gTripCounter = 0;
+        gRearmCounter = 0;
+    } else {
+        const bool tripCond  = dB < gBlob.config.tripB;
+        const bool rearmCond = dA > gBlob.config.rearmA;
+
+        if (gPermit) {
+            if (tripCond) {
+                if (gTripCounter < 255) ++gTripCounter;
+            } else {
+                gTripCounter = 0;
+            }
+
+            if (gTripCounter >= kTripConfirmCount) {
+                gPermit = false;
+                gTripCounter = 0;
+                gRearmCounter = 0;
+            }
+        } else {
+            if (rearmCond) {
+                if (gRearmCounter < 255) ++gRearmCounter;
+            } else {
+                gRearmCounter = 0;
+            }
+
+            if (gRearmCounter >= kRearmConfirmCount) {
+                gPermit = true;
+                gRearmCounter = 0;
+                gTripCounter = 0;
+            }
+        }
+    }
+
+    gBlob.runtime.inhibit = gPermit ? 0 : 1;
+    gBlob.runtime.warn    = (dA < gBlob.config.rearmA) ? 1 : 0;
+
+    setPermitOutput(gPermit);
+}
+
+// ============================================================
+// Arduino setup / loop
+// ============================================================
+
+void setup() {
+    Serial.begin(38400);
+
+    initSensePin(gRef);
+    initSensePin(gA);
+    initSensePin(gB);
+
+    pinMode(PIN_PERMIT_OC, INPUT); // released -> inhibit by default
+    timer1Init();
+
+    // Conservative defaults; tune via UART later.
+    gBlob.config.tripB   = 20;
+    gBlob.config.rearmA  = 40;
+
+    gBlob.runtime.inhibit = 1;
+    gBlob.runtime.warn    = 0;
+}
+
+void loop() {
+    updateStateFromMeasurement();
+    gSlave.loop();
+}
